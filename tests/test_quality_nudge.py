@@ -293,3 +293,174 @@ class TestYouTubeDegraded:
         # But nudge still fires
         assert q["nudge_text"] is not None
         assert "Degraded: YouTube" in q["nudge_text"]
+
+
+class TestYouTubeCaptionsDisabledDoesNotFalseFlag:
+    """Captions-disabled videos must not lower the transcript-fetch ratio.
+
+    A video where the uploader disabled captions can never produce a transcript,
+    no matter how fresh yt-dlp is. Counting it in the denominator of the
+    degraded-ratio check produces false positives - one captions-disabled video
+    in a small result set was triggering a "stale yt-dlp binary" nudge that was
+    wrong. Fix: subtract captions_disabled from the denominator.
+    """
+
+    def test_zero_captions_disabled_preserves_existing_behavior(self):
+        # Pre-existing case: 0 of 6 transcripts is still degraded (no captions
+        # disabled to discount). Behavior is unchanged from TestYouTubeDegraded.
+        q = _compute(
+            ytdlp_installed=True,
+            result_overrides={
+                "youtube_videos_count": 6,
+                "youtube_transcripts_count": 0,
+                "youtube_captions_disabled_count": 0,
+            },
+        )
+        assert "youtube" in q["core_degraded"]
+
+    def test_all_videos_captions_disabled_does_not_flag(self):
+        # Every returned video had captions disabled by the uploader.
+        # That's not a yt-dlp problem - it's an upstream content fact. Must not
+        # flag degraded.
+        q = _compute(
+            ytdlp_installed=True,
+            result_overrides={
+                "youtube_videos_count": 3,
+                "youtube_transcripts_count": 0,
+                "youtube_captions_disabled_count": 3,
+            },
+        )
+        assert "youtube" not in q["core_degraded"]
+
+    def test_mixed_uses_corrected_denominator(self):
+        # 6 videos, 3 captions_disabled, 2 transcripts.
+        # Naive (buggy) ratio: 2/6 = 33% (would flag).
+        # Corrected ratio: 2/(6-3) = 67% (does NOT flag).
+        # This case demonstrates the fix changes the verdict.
+        q = _compute(
+            ytdlp_installed=True,
+            result_overrides={
+                "youtube_videos_count": 6,
+                "youtube_transcripts_count": 2,
+                "youtube_captions_disabled_count": 3,
+            },
+        )
+        assert "youtube" not in q["core_degraded"]
+
+    def test_mixed_still_flags_when_truly_degraded(self):
+        # Even after discounting captions-disabled, the ratio is still bad.
+        # 8 videos, 1 captions_disabled, 1 transcript -> 1/(8-1) = 14% (flags).
+        q = _compute(
+            ytdlp_installed=True,
+            result_overrides={
+                "youtube_videos_count": 8,
+                "youtube_transcripts_count": 1,
+                "youtube_captions_disabled_count": 1,
+            },
+        )
+        assert "youtube" in q["core_degraded"]
+        # Nudge should still mention the stale yt-dlp possibility but also
+        # acknowledge that captions-disabled is a separate cause.
+        assert q["nudge_text"] is not None
+        assert "captions disabled" in q["nudge_text"].lower()
+
+    def test_missing_count_defaults_to_zero(self):
+        # Older callers that don't pass the new key still work (default 0).
+        q = _compute(
+            ytdlp_installed=True,
+            result_overrides={
+                "youtube_videos_count": 6,
+                "youtube_transcripts_count": 0,
+                # youtube_captions_disabled_count intentionally omitted
+            },
+        )
+        assert "youtube" in q["core_degraded"]
+
+
+class TestInstagramSilentFailure:
+    """Instagram is a `bonus` source via SC. Silent-failure detection: if SC
+    is configured but the source returned zero items, surface a nudge so the
+    user understands why the brief lacks an Instagram section.
+
+    Pre-fix the user got no signal - SC's /v2/instagram/reels/search 500s
+    frequently on multi-token queries and the pipeline silently returned
+    empty without any indication.
+    """
+
+    def test_zero_items_with_sc_flags_bonus_errored(self):
+        q = _compute(
+            config_overrides={
+                "AUTH_TOKEN": "tok123",
+                "SCRAPECREATORS_API_KEY": "sc_key",
+            },
+            ytdlp_installed=True,
+            result_overrides={"instagram_items_count": 0},
+        )
+        assert "instagram" in q["bonus_errored"]
+        assert q["nudge_text"] is not None
+        assert "Instagram" in q["nudge_text"]
+
+    def test_zero_items_without_sc_does_not_flag(self):
+        q = _compute(
+            config_overrides={"AUTH_TOKEN": "tok123"},
+            ytdlp_installed=True,
+            result_overrides={"instagram_items_count": 0},
+        )
+        assert "instagram" not in q.get("bonus_errored", [])
+
+    def test_nonzero_items_does_not_flag(self):
+        q = _compute(
+            config_overrides={
+                "AUTH_TOKEN": "tok123",
+                "SCRAPECREATORS_API_KEY": "sc_key",
+            },
+            ytdlp_installed=True,
+            result_overrides={"instagram_items_count": 5},
+        )
+        assert "instagram" not in q["bonus_errored"]
+        assert q["nudge_text"] is None
+
+    def test_missing_key_means_source_did_not_run(self):
+        q = _compute(
+            config_overrides={
+                "AUTH_TOKEN": "tok123",
+                "SCRAPECREATORS_API_KEY": "sc_key",
+            },
+            ytdlp_installed=True,
+        )
+        assert "instagram" not in q["bonus_errored"]
+        assert q["nudge_text"] is None
+
+    def test_nudge_text_explains_workaround(self):
+        q = _compute(
+            config_overrides={
+                "AUTH_TOKEN": "tok123",
+                "SCRAPECREATORS_API_KEY": "sc_key",
+            },
+            ytdlp_installed=True,
+            result_overrides={"instagram_items_count": 0},
+        )
+        assert q["nudge_text"] is not None
+        text_lower = q["nudge_text"].lower()
+        assert "instagram" in text_lower
+        assert ("0 reels" in text_lower or "silent" in text_lower
+                or "hashtag" in text_lower)
+
+    def test_bonus_errored_does_not_affect_core_score(self):
+        q = _compute(
+            config_overrides={
+                "AUTH_TOKEN": "tok123",
+                "SCRAPECREATORS_API_KEY": "sc_key",
+            },
+            ytdlp_installed=True,
+            result_overrides={"instagram_items_count": 0},
+        )
+        assert q["score_pct"] == 100
+        assert "instagram" in q["bonus_errored"]
+        assert q["nudge_text"] is not None
+        assert "Bonus source silent" in q["nudge_text"]
+
+    def test_bonus_errored_field_always_present(self):
+        q = _compute()
+        assert q.get("bonus_errored") == []
+
